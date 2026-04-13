@@ -1,0 +1,199 @@
+#include <SPI.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+#include <L298NX2.h>
+#include <Servo.h> 
+
+// --- RADIO SETUP (ARDUINO UNO) ---
+const int CE_PIN = 7;
+const int CSN_PIN = 8;
+// Uno Hardware SPI: MOSI=11, MISO=12, SCK=13
+RF24 radio(CE_PIN, CSN_PIN);
+const byte address[6] = "00001";
+
+// --- MOTOR PINS ---
+const int IN1 = A0; 
+const int IN2 = A1; 
+const int ENA = 5;  // Right Motor PWM
+
+const int IN3 = A2; 
+const int IN4 = A3; 
+const int ENB = 6;  // Left Motor PWM
+
+// --- STATUS LED & SERVO PINS ---
+const int LED_PIN = 2; 
+const int SERVO_PIN = 3; 
+
+L298NX2 motors(ENA, IN1, IN2, ENB, IN3, IN4);
+Servo carServo;
+
+struct ControlData {
+  int32_t packetID;      
+  int32_t joy1X, joy1Y;
+  int32_t joy2X, joy2Y;
+  int32_t potValue;
+  bool encButton, joy1Button, joy2Button;
+  bool extraButton, sw1, sw2;    
+};
+
+struct MotionData {
+  int32_t packetID;      
+  float accX, accY, accZ, gyroX, gyroY, gyroZ;
+};
+
+struct SystemData {
+  int32_t packetID;      
+  int32_t encoderPos;    
+  uint32_t uptime;       
+  float batteryVoltage;
+};
+
+ControlData cData; MotionData mData; SystemData sData;
+
+unsigned long lastPrintTime = 0;
+unsigned long lastPacketTime = 0; 
+int leftMotorSpeed = 0, rightMotorSpeed = 0;
+
+void setup() {
+  Serial.begin(115200); SPI.begin();
+  
+  pinMode(LED_PIN, OUTPUT);
+  carServo.attach(SERVO_PIN);
+  carServo.write(90); // Center servo on bootup
+
+  if (!radio.begin()) { Serial.println("Radio Hardware Error!"); while(1); }
+
+  radio.setChannel(108);               
+  radio.setDataRate(RF24_1MBPS);   
+  radio.setPALevel(RF24_PA_LOW);      
+  
+  // Match the Transmitter's secret behavior! Since Dynamic Payloads are OFF on the Transmitter, 
+  // the library artificially pads every packet to exactly 32 bytes automatically.
+  radio.setPayloadSize(32); 
+  
+  radio.openReadingPipe(1, address);
+  radio.startListening();
+
+  Serial.println("--- RC CAR ONLINE (ARDUINO UNO) ---");
+}
+
+void loop() {
+  bool newPacket = false;
+
+  // ==========================================
+  // 1. DRAIN THE RADIO BUFFER AT LIGHTNING SPEED
+  // ==========================================
+  while (radio.available()) {
+    newPacket = true;
+    lastPacketTime = millis(); // Reset failsafe instantly upon ANY incoming packet!
+    
+    uint8_t buffer[32];
+    radio.read(buffer, 32); 
+
+    int32_t incomingID;
+    memcpy(&incomingID, buffer, sizeof(int32_t));
+
+    // Save the padded 32-byte chunks safely into our specific memory structures!
+    if (incomingID == 101) memcpy(&cData, buffer, sizeof(ControlData));
+    else if (incomingID == 102) memcpy(&mData, buffer, sizeof(MotionData));
+    else if (incomingID == 103) memcpy(&sData, buffer, sizeof(SystemData));
+  }
+
+  // ==========================================
+  // 2. RADIO FAILSAFE & ACTIVE LED
+  // ==========================================
+  if (millis() - lastPacketTime > 500) {
+    motors.stop(); 
+    leftMotorSpeed = 0; rightMotorSpeed = 0;
+    digitalWrite(LED_PIN, LOW); // DISCONNECTED 
+  } else {
+    // Only turn on the LED if this receiver is actively being controlled (SW2 is exactly ON)
+    if (cData.sw2 == true) digitalWrite(LED_PIN, HIGH);
+    else digitalWrite(LED_PIN, LOW);
+  }
+
+  // ==========================================
+  // 3. ENCODER TOP-SPEED LIMITER (50% to 100%)
+  // ==========================================
+  static int32_t lastEncoderPos = 0;
+  static float speedPulse = 50.0; // Boots up at top value (50 out of 50)
+
+  if (sData.encoderPos != lastEncoderPos) {
+    int32_t delta = sData.encoderPos - lastEncoderPos;
+    
+    speedPulse += delta; // 1 physical click = 1 pulse
+    
+    // Lock the pulse counter strictly between 0 and 50
+    if (speedPulse > 50.0) speedPulse = 50.0;
+    if (speedPulse < 0.0) speedPulse = 0.0;
+    
+    lastEncoderPos = sData.encoderPos;
+  }
+
+  // Map 0 -> 50 pulses into a multiplier of 0.50 -> 1.00 (50% to 100% Speed)
+  float speedMultiplier = ((speedPulse / 50.0) * 0.50) + 0.50;
+
+  // ==========================================
+  // 4. EXECUTE HARDWARE COMMANDS SAFELY 
+  // ==========================================
+  if (newPacket) {
+    if (cData.sw2 == true) {
+      
+      // ---> SERVO CONTROL (Via Right Joystick X-Axis) <---
+      int servoAngle = map(cData.joy2X, 0, 4095, 0, 180);
+      if (cData.joy2X > 1800 && cData.joy2X < 2300) servoAngle = 90; // Generous deadzone to stop jittering
+      carServo.write(servoAngle);
+
+      // ---> MPU TILT DRIVING <---
+      float deadzone = 1.5; 
+      
+      // MPU ROTATION FIX: Left and Right are now inverted!
+      float y_val = mData.accX; 
+      float x_val = -mData.accY; // Put the minus sign back!
+
+      if (abs(y_val) < deadzone) y_val = 0;
+      if (abs(x_val) < deadzone) x_val = 0;
+
+      // Multiply by 10 initially, then apply the ENCODER Speed Multiplier perfectly!
+      int speedY = map(constrain(y_val * 10, -60, 60), -60, 60, -255, 255) * speedMultiplier; 
+      int speedX = map(constrain(x_val * 10, -60, 60), -60, 60, -255, 255) * speedMultiplier; 
+
+      // Skid Steer Tank Mix
+      rightMotorSpeed = constrain(speedY - speedX, -255, 255);  
+      leftMotorSpeed  = constrain(speedY + speedX, -255, 255);   
+
+      // Push commands to Right Motor
+      if (rightMotorSpeed > 0) { motors.setSpeedA(rightMotorSpeed); motors.forwardA(); } 
+      else if (rightMotorSpeed < 0) { motors.setSpeedA(abs(rightMotorSpeed)); motors.backwardA(); } 
+      else { motors.stopA(); }
+
+      // Push commands to Left Motor
+      if (leftMotorSpeed > 0) { motors.setSpeedB(leftMotorSpeed); motors.forwardB(); } 
+      else if (leftMotorSpeed < 0) { motors.setSpeedB(abs(leftMotorSpeed)); motors.backwardB(); } 
+      else { motors.stopB(); }
+
+    } else {
+      // PAUSED STATE (SW2 is completely OFF)
+      leftMotorSpeed = 0; rightMotorSpeed = 0;
+      motors.stop();
+    }
+  }
+
+  // ==========================================
+  // 5. NON-BLOCKING SERIAL DEBUGGING
+  // ==========================================
+  if (millis() - lastPrintTime >= 200) {
+    lastPrintTime = millis();
+    
+    if (millis() - lastPacketTime > 500) {
+      Serial.println("WARNING: RADIO SIGNAL LOST! Motors locked.");
+    } else if (cData.sw2 == false) {
+      Serial.println("SYSTEM PAUSED (SW2 is OFF).");
+    } else {
+      Serial.print("MaxSpeed: "); Serial.print(speedMultiplier * 100); Serial.print("%");
+      Serial.print(" \t| Tilt Y: "); Serial.print(mData.accX); // Printing raw mapped axis
+      Serial.print(" \t|| L_Spd: "); Serial.print(leftMotorSpeed);
+      Serial.print(" \t| R_Spd: "); Serial.println(rightMotorSpeed);
+    }
+  }
+}
