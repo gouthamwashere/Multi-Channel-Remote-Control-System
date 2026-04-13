@@ -1,0 +1,147 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+// --- PIN DEFINITIONS ---
+#define CE_PIN 22
+#define CSN_PIN 5
+#define ENC_CLK 25
+#define ENC_DT 26
+#define ENC_SW 15
+#define J1_X 34
+#define J1_Y 35
+#define J1_SW 33
+#define J2_X 36
+#define J2_Y 39
+#define J2_SW 27
+#define POT_PIN 32
+#define BATT_PIN 4      // Battery Sensing on D4
+#define EXTRA_BTN 13    // Push Button
+#define SW1_PIN 16      // Toggle Switch 1
+#define SW2_PIN 17      // Toggle Switch 2
+#define I2C_SDA 21
+#define I2C_SCL 14
+
+RF24 radio(CE_PIN, CSN_PIN); 
+Adafruit_SH1106G display(128, 64, &Wire, -1);
+Adafruit_MPU6050 mpu;
+const byte address[6] = "00001";
+
+// --- DATA STRUCTURES ---
+struct ControlData {
+  int packetID; // 101
+  int joy1X, joy1Y, joy2X, joy2Y, potValue;
+  bool encButton, joy1Button, joy2Button;
+  bool extraButton, sw1, sw2;    
+};
+
+struct MotionData {
+  int packetID; // 102
+  float accX, accY, accZ, gyroX, gyroY, gyroZ;
+};
+
+struct SystemData {
+  int packetID; // 103
+  long encoderPos;
+  unsigned long uptime;
+  float batteryVoltage;
+};
+
+ControlData cData; MotionData mData; SystemData sData;
+volatile long encoderPos = 0;
+
+void IRAM_ATTR readEncoder() {
+  if (digitalRead(ENC_DT) == digitalRead(ENC_CLK)) encoderPos++;
+  else encoderPos--;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  
+  display.begin(0x3C, true);
+  display.setTextColor(SH110X_WHITE);
+  display.setTextSize(1);
+  
+  if (!mpu.begin(0x68)) Serial.println("MPU Fail");
+  
+  // MATCH YOUR HARDWARE SPI PINS
+  SPI.begin(19, 18, 23, 5); 
+  
+  if (!radio.begin()) { Serial.println("Radio Hardware Error!"); while(1); }
+  
+  radio.setChannel(108);             // match receiver
+  radio.setDataRate(RF24_1MBPS);     // match receiver
+  radio.setPALevel(RF24_PA_HIGH);    // boost power
+  radio.setRetries(5, 15);           // retry if ack fails
+  radio.openWritingPipe(address);
+  radio.stopListening();
+  
+  pinMode(ENC_CLK, INPUT_PULLUP); pinMode(ENC_DT, INPUT_PULLUP); pinMode(ENC_SW, INPUT_PULLUP);
+  pinMode(J1_SW, INPUT_PULLUP); pinMode(J2_SW, INPUT_PULLUP);
+  pinMode(EXTRA_BTN, INPUT_PULLUP); pinMode(SW1_PIN, INPUT_PULLUP); pinMode(SW2_PIN, INPUT_PULLUP);
+  pinMode(POT_PIN, INPUT); pinMode(BATT_PIN, INPUT);
+  
+  attachInterrupt(digitalPinToInterrupt(ENC_CLK), readEncoder, CHANGE);
+}
+
+void loop() {
+  sensors_event_t a, g, t;
+  mpu.getEvent(&a, &g, &t);
+
+  // Read Inputs
+  cData.packetID = 101;
+  cData.joy1X = analogRead(J1_X); cData.joy1Y = analogRead(J1_Y);
+  cData.joy2X = analogRead(J2_X); cData.joy2Y = analogRead(J2_Y);
+  cData.potValue = analogRead(POT_PIN);
+  cData.encButton = !digitalRead(ENC_SW);
+  cData.joy1Button = !digitalRead(J1_SW);
+  cData.joy2Button = !digitalRead(J2_SW);
+  cData.extraButton = !digitalRead(EXTRA_BTN);
+  cData.sw1 = !digitalRead(SW1_PIN);
+  cData.sw2 = !digitalRead(SW2_PIN);
+
+  mData.packetID = 102;
+  mData.accX = a.acceleration.x; mData.accY = a.acceleration.y; mData.accZ = a.acceleration.z;
+  mData.gyroX = g.gyro.x; mData.gyroY = g.gyro.y; mData.gyroZ = g.gyro.z;
+
+  sData.packetID = 103;
+  sData.encoderPos = encoderPos;
+  sData.uptime = millis();
+  
+  // --- Calibrated & Smoothed Voltage Reading ---
+  // Calibrated Factor: (7.54V Multimeter actual / 7.20V Code observed) * 4.0303 = 4.22
+  static float smoothedVolt = 7.54; 
+  float rawADC = analogRead(BATT_PIN);
+  float instantVolt = (rawADC / 4095.0) * 3.3 * 4.22;
+  
+  // Smoothing: 92% old value, 8% new value to remove jitter
+  smoothedVolt = (smoothedVolt * 0.92) + (instantVolt * 0.08); 
+  sData.batteryVoltage = smoothedVolt;
+
+  // Send packets
+  bool ok1 = radio.write(&cData, sizeof(ControlData));
+  bool ok2 = radio.write(&mData, sizeof(MotionData));
+  bool ok3 = radio.write(&sData, sizeof(SystemData));
+
+  // --- SERIAL LOG ---
+  Serial.printf("[TX] Status:%d%d%d | %.2fV | J1:%4d | J2:%4d\n", 
+                ok1, ok2, ok3, sData.batteryVoltage, cData.joy1X, cData.joy2X);
+
+  // --- OLED ---
+  display.clearDisplay(); display.setCursor(0,0);
+  display.printf("TX: %s  %.2fV\n", (ok1&&ok2&&ok3)?"ONLINE":"FAIL", sData.batteryVoltage);
+  display.printf("Pot:%4d  Enc:%ld\n", cData.potValue, encoderPos);
+  display.printf("J1:%4d %4d\n", cData.joy1X, cData.joy1Y);
+  display.printf("J2:%4d %4d\n", cData.joy2X, cData.joy2Y);
+  display.printf("ExB:%d S1:%d S2:%d\n", cData.extraButton, cData.sw1, cData.sw2);
+  display.display();
+
+  delay(20);
+}
