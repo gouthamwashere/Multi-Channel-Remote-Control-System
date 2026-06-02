@@ -1,4 +1,4 @@
-# Multi-Channel-Remote-Control-System
+# Multi-Channel-RC-Remote-Controller
 Submitted as a Mini-Project.
 
 Team Members:
